@@ -82,7 +82,7 @@ def lambda_handler(event, context):
         return response(500, {}, {"message": "Server connection error."})
 
     # 測定時間間隔(分)
-    section_range = 30
+    section_range = 10
 
     # 基準時間の算出
     # まずは日本時間になおしてから
@@ -127,14 +127,16 @@ def lambda_handler(event, context):
                 prev_heatmap_log = make_heatmap_log(user)
 
             # 店舗情報の取得
-            cur.execute('SELECT name, description FROM regi_users WHERE userid = %s', user)
+            cur.execute('SELECT name, description, map, map_x, map_y FROM regi_users WHERE userid = %s', user)
             data = cur.fetchall()
             name = None
             description = None
+            map_info = None
             if len(data) == 0:
                 return response(404, {}, {'message': 'User not found.'})
             else:
                 name, description = data[0]['name'], data[0]['description']
+                map_info = {'map': data[0]['map'], 'x': data[0]['map_x'], 'y': data[0]['map_y']}
 
             # 売上ログから、該当時間帯のログを作成
             work_time = 0
@@ -166,19 +168,43 @@ def lambda_handler(event, context):
 
                 # 待機時間の標準偏差
                 ## まだ使用予定はないが、今後使っていきたい
-                waiting_stdev = 0
+                ## 標準偏差が低ければ低いほど、一定時間ごとに客が来ている。
+                ## 一定時間で客が来る→レジが並んでいるという判断が可能。
+                ## 確実な判断材料ではないため、係数はやや低め。
+                waiting_stdev_coef = 1
                 if len(waiting_times) > 1:
-                    waiting_stdev = stdev(waiting_times)
+                    stdev = stdev(waiting_times)
+                    if stdev > 60:
+                        waiting_stdev_coef = 1
+                    elif 60 >= stdev > 30:
+                        waiting_stdev_coef = 1.25
+                    else:
+                        waiting_stdev_coef = 1.5
 
             # 売上回数
             sale_num = len(sale_log)
+            
+            ratio = 0
+            if sale_num < section_range * 0.5:
+                # 売上回数が0.5回/分以下
+                ratio = 1
+            elif sale_num > section_range * 1:
+                # 売上回数が0.5回/分以下
+                ratio = 2
+            elif sale_num > section_range * 2:
+                ratio = 3
+            elif sale_num > section_range * 4:
+                ratio = 4
+            elif sale_num > section_range * 6:
+                # 10秒に1回の売上を出し続けないとならない
+                ratio = 5
 
             # 稼働率の算出
-            # 
             working_rate = work_time / section_range
 
             change_rate = None
             color = None
+            
             if working_rate == 0:
                 # まったく稼働していない
                 # 状態は準備中。
@@ -198,7 +224,7 @@ def lambda_handler(event, context):
                 # ほとんど稼働していない
                 # 販売中だけど、ほとんど稼働していないということを伝えたい
                 # 混雑度は通常通りに計算するけど、状態は準備中とする。
-                confusion_rate = sale_num / working_rate
+                confusion_rate = sale_num / working_rate * waiting_stdev_coef
                 change_rate = 0
                 if prev_heatmap_log['confusion_rate'] != 0:
                     change_rate = confusion_rate / prev_heatmap_log['confusion_rate']
@@ -216,7 +242,7 @@ def lambda_handler(event, context):
                 # 混雑度の算出
                 # 混雑度 = 売上回数 / 稼働率
                 # 稼働率300%で9回の売り上げと、稼働率100%で3回の売り上げの混雑度は等しい。
-                confusion_rate = sale_num / working_rate
+                confusion_rate = sale_num / working_rate * waiting_stdev_coef
 
                 # 混雑指標の算出
                 change_rate = 0
@@ -242,24 +268,15 @@ def lambda_handler(event, context):
                     change_status = 'flat'
                     color = '#07d34f' # green
 
-            # マップ情報をとってくる
-            ## 現状、未完成のため、適当な座標を突っ込む
-            ## 予定：
-            ## cur.execute('SELECT (x, y) FROM maps WHERE user_id = {}'.format(user_id))
-
-            map_pos = 0
-            map_x = 123
-            map_y = 456
-
             booth_info = make_booth_info(name,
                                      description,
-                                     {'map': map_pos, 'x': map_x, 'y': map_y},
+                                     map_info,
                                      color,
                                      sale_num,
                                      None)
                                      
             hm_log = make_heatmap_log(user,
-                                      sale_num, 
+                                      ratio, 
                                       working_rate,
                                       confusion_rate,
                                       change_rate,
